@@ -22,6 +22,8 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.*
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -57,6 +59,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var signer:      ForensicSigner
     private lateinit var threatDb:    ThreatIntelManager
     private lateinit var bioExtractor: BiomarkerExtractor
+    private lateinit var ensemble:  EnsembleScorer
+    private lateinit var yinDetect: YINPitchDetector
 
     private var notifTs  = 0L
     private var lastSig  = ""
@@ -91,6 +95,10 @@ class MainActivity : ComponentActivity() {
     private val sPredicted5  = mutableFloatStateOf(0f)
     private val sProtection  = mutableIntStateOf(100)
     private val sF0History   = mutableStateOf(listOf<Float>())   // pitch over time
+    private val sEnsemble    = mutableStateOf<EnsembleResult?>(null)
+    private val sConflict    = mutableStateOf(false)
+    private val sDominant    = mutableStateOf("ENSEMBLE")
+    private val sEnsWeights  = mutableStateOf(mapOf<String,Float>())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -104,6 +112,8 @@ class MainActivity : ComponentActivity() {
         signer     = ForensicSigner(this)
         threatDb   = ThreatIntelManager(this)
         bioExtractor = BiomarkerExtractor()
+        ensemble  = EnsembleScorer()
+        yinDetect = YINPitchDetector()
         demoMgr    = DemoModeManager { buf -> offer(buf) }
 
         setContent {
@@ -120,6 +130,10 @@ class MainActivity : ComponentActivity() {
 
     private fun goLive() {
         if (sScanning.value) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            reqAudio.launch(Manifest.permission.RECORD_AUDIO); return
+        }
         resetState(InputMode.LIVE)
         DetectionService.start(this)
         capture.startCapture { buf -> offer(buf) }
@@ -129,10 +143,12 @@ class MainActivity : ComponentActivity() {
     private fun goDemo() {
         if (sScanning.value) return
         resetState(InputMode.DEMO)
-        DetectionService.start(this)
+        // Demo mode doesn't use the mic — skip DetectionService entirely to avoid
+        // the Android 14 SecurityException (FGS type=microphone needs RECORD_AUDIO).
         demoMgr.startDemo()
         tickTimer()
     }
+
 
     private fun goFile() = pickFile.launch("audio/*")
 
@@ -170,21 +186,14 @@ class MainActivity : ComponentActivity() {
                     sWave.value = FloatArray(200) { i -> buf[(i * step).coerceAtMost(buf.size - 1)] }
                 }
 
-                // ── Bug #19 fix: SNR gate threshold ──────────────────────────
-                // computeSNR() now returns 0–60 dB (was always returning ~10 dB).
-                // A signal with SNR < 3 dB is essentially pure noise — skip it.
                 val snr = features.computeSNR(buf)
                 if (snr < 3f && sMode.value != InputMode.DEMO) {
-                    busy.set(false)
-                    return@launch
+                    busy.set(false); return@launch
                 }
 
-                // ── Bug #4 fix: compute mel ONCE, derive MFCC from it ────────
-                // Was: extractMelSpectrogram(buf) + extractMfcc(buf) = 2× mel compute
                 val mel  = features.extractMelSpectrogram(buf)
-                val mfcc = features.extractMfccFromMel(mel)   // reuses mel, no recompute
+                val mfcc = features.extractMfccFromMel(mel)
 
-                // Aggregate mel bands for ring visualisation
                 val nF = (mel.size / 80).coerceAtLeast(1)
                 val mb = FloatArray(80) { b ->
                     var s = 0f
@@ -196,15 +205,14 @@ class MainActivity : ComponentActivity() {
                     it.add(mb.copyOf()); if (it.size > 60) it.removeAt(0)
                 }
 
-                // ── Bug #20 fix: use bioExtractor class instance ──────────────
-                // BiomarkerExtractor is now stateful (tracks prevMelFrame for
-                // temporal flux).  Using the object directly would carry stale
-                // prevMelFrame across sessions.
                 val bio = bioExtractor.extract(buf, mb)
                 sBio.value = bio
 
+                val yin = yinDetect.detect(buf)
+
                 sF0History.value = sF0History.value.toMutableList().also {
-                    it.add(bio.f0Estimate); if (it.size > 200) it.removeAt(0)
+                    it.add(if (yin.frequency > 0f) yin.frequency else bio.f0Estimate)
+                    if (it.size > 200) it.removeAt(0)
                 }
 
                 val known = sMode.value != InputMode.DEMO && threatDb.isThreat(mfcc)
@@ -213,14 +221,36 @@ class MainActivity : ComponentActivity() {
                 val drift = voiceId.process(mfcc)
                 sWindows.intValue++
 
-                val raw = when {
+                val aasistRaw: Float = when {
                     sMode.value == InputMode.DEMO -> demoMgr.getDemoScore()
                     known -> 0.95f
                     else  -> model.classifyAudio(buf, mel, bio)
                 }
 
                 sLatency.floatValue = model.lastLatencyMs
-                val ema = engine.processBatch(listOf(raw))
+
+                val newAttrib: Attribution? = when {
+                    sMode.value == InputMode.DEMO && aasistRaw >= 0.40f -> demoMgr.currentClipAttribution()
+                    sMode.value != InputMode.DEMO && aasistRaw >= 0.25f ->
+                        attrEngine.attribute(mel).takeIf { it.engine != "Unknown" }
+                    else -> null
+                }
+
+                val ensResult = ensemble.score(
+                    aasist      = aasistRaw,
+                    bio         = bio,
+                    attribution = newAttrib,
+                    drift       = drift,
+                    modelActive = model.inferenceEngine != "MOCK"
+                )
+
+                sEnsemble.value   = ensResult
+                sConflict.value   = ensResult.conflictFlag
+                sDominant.value   = ensResult.dominantSignal
+                sEnsWeights.value = ensemble.weights()
+
+                val raw = ensResult.score
+                val ema = engine.processBatch(listOf(raw) ?: emptyList())
 
                 val esc = ThreatEscalationEngine.analyse(
                     sHistory.value, engine.currentSensitivity.threshold, engine.currentSession)
@@ -239,14 +269,7 @@ class MainActivity : ComponentActivity() {
                 sEma.floatValue   = ema
                 sDrift.floatValue = drift.driftPercent
 
-                val newA: Attribution? = when {
-                    sMode.value == InputMode.DEMO && ema >= .40f -> demoMgr.currentClipAttribution()
-                    sMode.value != InputMode.DEMO && ema >= .30f ->
-                        attrEngine.attribute(mel).takeIf { it.engine != "Unknown" }
-                    ema < .15f -> null
-                    else       -> sAttrib.value
-                }
-                if (newA != null || ema < .15f) sAttrib.value = newA
+                if (newAttrib != null || ema < 0.15f) sAttrib.value = newAttrib
 
                 sHistory.value = sHistory.value.toMutableList().also {
                     it.add(ema); if (it.size > 200) it.removeAt(0)
@@ -255,7 +278,10 @@ class MainActivity : ComponentActivity() {
                 val evs = engine.currentSession?.events?.toList() ?: emptyList()
                 if (evs.size > sEvents.value.size) {
                     sAlert.value = true
-                    if (ema > 0.75f) threatDb.reportConfirmedFake(mfcc)
+                    if (ema > 0.75f) {
+                        threatDb.reportConfirmedFake(mfcc)
+                        ensemble.onConfirmedFake(ensResult)
+                    }
                     launch(Dispatchers.Main) { delay(5500); sAlert.value = false }
                 }
                 if (drift.alert && !sAlert.value) {
@@ -280,6 +306,7 @@ class MainActivity : ComponentActivity() {
     private fun resetState(mode: InputMode) {
         sThreat.value=false; lastSig=""; lastPub=""
         engine.startSession(); voiceId.reset(); bioExtractor.reset()
+        ensemble.reset(); yinDetect.reset()
         sHistory.value=listOf(); sAlert.value=false; sAttrib.value=null
         sWindows.intValue=0; sWaterfall.value=listOf(); sBio.value=null
         sEscalation.value=null; sF0History.value=listOf()
@@ -370,6 +397,9 @@ class MainActivity : ComponentActivity() {
         val escalation = sEscalation.value
         val predicted5 = sPredicted5.floatValue
         val protection = sProtection.intValue
+        val ensWeights  = sEnsWeights.value
+        val dominant    = sDominant.value
+        val conflictFlag = sConflict.value
 
         val inf = rememberInfiniteTransition(label="main")
         val blink by inf.animateFloat(0f,1f, infiniteRepeatable(tween(550),RepeatMode.Reverse), label="bl")
@@ -393,11 +423,40 @@ class MainActivity : ComponentActivity() {
                 Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
                     Column {
                         Row(verticalAlignment=Alignment.CenterVertically) {
-                            Box(Modifier.size(5.dp).clip(RoundedCornerShape(3.dp))
-                                .background(statusCol.copy(if(scanning) .5f+blink*.5f else .3f)))
-                            Spacer(Modifier.width(7.dp))
-                            Text("VOICESHIELD",fontFamily=FontFamily.Monospace,fontSize=12.sp,
-                                fontWeight=FontWeight.Black,color=statusCol,letterSpacing=4.sp)
+                            // ── TOP 0.1% DEVELOPER LOGO DESIGN ─────────────
+                            // Master component handling precise sizing & unbreakable aspect ratio
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .height(30.dp) // Explicit size anchor
+                                    .aspectRatio(1f) // Unbreakable 1:1 aspect ratio constraint
+                                    .background(
+                                        brush = Brush.radialGradient(
+                                            colors = listOf(statusCol.copy(if(scanning) 0.35f + blink*0.15f else 0.1f), Color.Transparent),
+                                            radius = 45f
+                                        ),
+                                        shape = RoundedCornerShape(6.dp)
+                                    )
+                                    .border(
+                                        width = 1.dp,
+                                        brush = Brush.linearGradient(listOf(statusCol.copy(0.7f), statusCol.copy(0.15f))),
+                                        shape = RoundedCornerShape(6.dp)
+                                    )
+                                    .padding(3.dp) // Outer padding for visual breathing room
+                            ) {
+                                Image(
+                                    painter = painterResource(id = R.drawable.ic_launcher),
+                                    contentDescription = "VoiceShield Adaptive Logo",
+                                    contentScale = ContentScale.Fit, // Never stretches; mathematically scales
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .clip(RoundedCornerShape(4.dp)),
+                                    alpha = if (scanning) 1f else 0.7f
+                                )
+                            }
+                            Spacer(Modifier.width(10.dp))
+                            Text("VOICESHIELD",fontFamily=FontFamily.Monospace,fontSize=15.sp,
+                                fontWeight=FontWeight.Black,color=statusCol,letterSpacing=3.sp)
                         }
                         Text("NEURAL FORENSIC TERMINAL  REV-5.0",
                             fontFamily=FontFamily.Monospace,fontSize=7.sp,color=Ink,letterSpacing=1.5.sp,
@@ -538,24 +597,9 @@ class MainActivity : ComponentActivity() {
                 }
 
                 // ── ATTRIBUTION ───────────────────────────────────────────
-                if (attrib!=null&&ema>=.25f) {
+                if (attrib != null && ema >= 0.25f) {
                     Spacer(Modifier.height(6.dp))
-                    Row(Modifier.fillMaxWidth()
-                        .background(CrimsonDim,RoundedCornerShape(4.dp))
-                        .border(.5.dp,Crimson.copy(.35f),RoundedCornerShape(4.dp))
-                        .padding(horizontal=12.dp,vertical=10.dp),
-                        Arrangement.SpaceBetween,Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            TinyL("HEURISTIC ATTRIBUTION",Crimson.copy(.5f))
-                            Text(attrib.engine.uppercase(),fontFamily=FontFamily.Monospace,
-                                fontSize=15.sp,fontWeight=FontWeight.Black,color=Amber)
-                            Text(attrib.reason,fontFamily=FontFamily.Monospace,
-                                fontSize=8.sp,color=InkMid,modifier=Modifier.padding(top=2.dp))
-                        }
-                        Text("${(attrib.confidence*100).toInt()}%",
-                            fontFamily=FontFamily.Monospace,fontSize=26.sp,
-                            fontWeight=FontWeight.Black,color=Amber)
-                    }
+                    AttributionMatrix(attrib, ema, Modifier.fillMaxWidth())
                 }
 
                 // ── DATA CELLS ────────────────────────────────────────────
@@ -568,6 +612,11 @@ class MainActivity : ComponentActivity() {
                         when{drift>25f->Crimson;drift>10f->Amber;else->Phosphor}, Modifier.weight(1f))
                     DataCell("FLAGS",   "${events.size}",
                         if(flagged) Crimson else InkMid, Modifier.weight(1f))
+                }
+
+                if (scanning || engine.currentSession != null) {
+                    Spacer(Modifier.height(5.dp))
+                    EnsembleWeightDisplay(ensWeights, dominant, conflictFlag, Modifier.fillMaxWidth())
                 }
 
                 // ── BIOMARKER PANEL ───────────────────────────────────────
