@@ -2,93 +2,84 @@ package com.unstop.aivoicedetector
 
 import kotlin.math.sqrt
 
-/**
- * Tracks voice identity across a call.
- * Builds MFCC baseline in first BASELINE_WINDOWS windows,
- * then alerts if cosine similarity drops below threshold.
- * Catches mid-call voice switching — the most dangerous deepfake attack.
- *
- * FIXES applied:
- *  - Bug #14 CRITICAL: cosineSimilarity previously crashed with
- *    ArrayIndexOutOfBoundsException when a.size ≠ b.size (possible on device
- *    rotation, audio buffer size changes, or session edge cases).
- *    Now uses minOf(a.size, b.size) for safe iteration.
- *  - Bug #15: DRIFT_THRESHOLD lowered from 0.75f to 0.68f.
- *    Same-speaker MFCC cosine similarity naturally varies 0.70–0.90 across
- *    different phonemes and stress patterns.  0.75 caused frequent false alerts
- *    on normal speech variation.  0.68 only triggers on genuine identity shifts.
- */
-data class DriftResult(
-    val similarity:    Float,
-    val driftPercent:  Float,
-    val alert:         Boolean,
-    val alertMessage:  String = ""
-)
-
 class VoiceContinuityEngine {
 
-    private var baseline: FloatArray? = null
-    private var windowsSeen = 0
+    private var baseline:    FloatArray? = null
+    private var windowsSeen  = 0
+    private val DRIFT_THRESHOLD  = 0.62f    // recalibrated for 39-dim feature space
+    private val BASELINE_WINDOWS = 15
+    private val EMA_ALPHA        = 0.15f    // baseline update rate after lock-in
 
-    // Bug #15 fix: was 0.75f — too strict for natural intra-speaker variability
-    private val DRIFT_THRESHOLD   = 0.68f
-    private val BASELINE_WINDOWS  = 3
+    private val simHistory = ArrayDeque<Float>(30)
 
-    fun reset() {
-        baseline    = null
-        windowsSeen = 0
-    }
+    fun reset() { baseline = null; windowsSeen = 0; simHistory.clear() }
 
-    fun process(mfcc: FloatArray): DriftResult {
+    /**
+     * Process one 39-dim MFCC+delta+delta-delta vector.
+     * Falls back gracefully to 13-dim MFCC if full vector not available.
+     */
+    fun process(features: FloatArray): DriftResult {
         windowsSeen++
+        val normed = zNorm(features)
 
-        // Build rolling baseline over first BASELINE_WINDOWS windows
         if (windowsSeen <= BASELINE_WINDOWS) {
             baseline = when (val base = baseline) {
-                null -> mfcc.copyOf()
+                null -> normed.copyOf()
                 else -> {
-                    // Element-wise running average; handles size mismatch safely
-                    val len = minOf(base.size, mfcc.size)
-                    FloatArray(len) { i -> (base[i] + mfcc[i]) / 2f }
+                    // EMA update — recent windows weighted more than early ones
+                    val len = minOf(base.size, normed.size)
+                    FloatArray(len) { i ->
+                        (1f - EMA_ALPHA) * base[i] + EMA_ALPHA * normed[i]
+                    }
                 }
             }
+            simHistory.addLast(1f)
             return DriftResult(1f, 0f, false)
         }
 
         val base = baseline ?: return DriftResult(1f, 0f, false)
-        val sim   = cosineSimilarity(base, mfcc)
+        val sim  = cosineSimilarity(base, normed)
+
+        // Continue EMA update of baseline — tracks slow voice changes (fatigue, emotion)
+        // but not sudden swaps (deepfake attack)
+        val len2 = minOf(base.size, normed.size)
+        if (sim > DRIFT_THRESHOLD) {
+            // Only update baseline when voice matches — prevents poisoning on attack
+            baseline = FloatArray(len2) { i ->
+                (1f - EMA_ALPHA) * base[i] + EMA_ALPHA * normed[i]
+            }
+        }
+
         val drift = ((1f - sim) * 100f).coerceIn(0f, 100f)
         val alert = sim < DRIFT_THRESHOLD
+
+        if (simHistory.size >= 30) simHistory.removeFirst()
+        simHistory.addLast(sim)
 
         return DriftResult(
             similarity   = sim,
             driftPercent = drift,
             alert        = alert,
-            alertMessage = if (alert) "VOICE IDENTITY CHANGED — possible mid-call switch" else ""
+            alertMessage = if (alert) "VOICE IDENTITY CHANGED — possible mid-call switch" else "",
         )
     }
 
-    /**
-     * Bug #14 FIX — was: `a.forEachIndexed { i, v -> ... b[i] }`
-     * Crashes with ArrayIndexOutOfBoundsException if b.size < a.size.
-     *
-     * Fix: iterate up to minOf(a.size, b.size) so all accesses are valid.
-     * This can occur legitimately when the MFCC array size changes between
-     * audio windows (e.g. short final window, device audio buffer resize).
-     */
+    fun similarityHistory(): List<Float> = simHistory.toList()
+
+    // Removes global energy/loudness bias from cosine comparison
+    private fun zNorm(v: FloatArray): FloatArray {
+        if (v.isEmpty()) return v
+        val mean = v.average().toFloat()
+        val std  = sqrt(v.map { (it - mean) * (it - mean) }.average().toFloat())
+            .coerceAtLeast(1e-8f)
+        return FloatArray(v.size) { i -> (v[i] - mean) / std }
+    }
+
     private fun cosineSimilarity(a: FloatArray, b: FloatArray): Float {
         val len = minOf(a.size, b.size)
         if (len == 0) return 0f
-
-        var dot = 0.0
-        var na  = 0.0
-        var nb  = 0.0
-        for (i in 0 until len) {
-            dot += a[i] * b[i]
-            na  += a[i] * a[i]
-            nb  += b[i] * b[i]
-        }
-
+        var dot = 0.0; var na = 0.0; var nb = 0.0
+        for (i in 0 until len) { dot += a[i]*b[i]; na += a[i]*a[i]; nb += b[i]*b[i] }
         val denom = sqrt(na) * sqrt(nb)
         return if (denom < 1e-9) 0f else (dot / denom).toFloat().coerceIn(-1f, 1f)
     }

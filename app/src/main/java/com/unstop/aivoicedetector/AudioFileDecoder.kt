@@ -49,7 +49,13 @@ object AudioFileDecoder {
                 val pcm16k = mutableListOf<Float>()
                 val info   = MediaCodec.BufferInfo()
                 var eos    = false
-                var srcBuf = mutableListOf<Short>()  // accumulate raw shorts
+                var srcArr = ShortArray(65536)
+                var srcLen = 0
+
+                fun appendShort(s: Short) {
+                    if (srcLen >= srcArr.size) srcArr = srcArr.copyOf(srcArr.size * 2)
+                    srcArr[srcLen++] = s
+                }
 
                 while (!eos) {
                     // feed input
@@ -77,7 +83,7 @@ object AudioFileDecoder {
                         while (i < shorts.size) {
                             var mono = 0L
                             repeat(channels) { c -> mono += shorts.getOrElse(i + c) { 0 } }
-                            srcBuf.add((mono / channels).toShort())
+                            appendShort((mono / channels).toShort())
                             i += channels
                         }
                         codec.releaseOutputBuffer(outIdx, false)
@@ -88,16 +94,16 @@ object AudioFileDecoder {
                 codec.stop(); codec.release(); extractor.release()
 
                 // resample srcSR → 16kHz via linear interpolation
-                if (srcBuf.isEmpty()) return@withContext null
+                if (srcLen == 0) return@withContext null
                 val ratio   = srcSR.toDouble() / TARGET_SR
-                val outLen  = (srcBuf.size / ratio).toInt()
+                val outLen  = (srcLen / ratio).toInt()
                 val mono16k = FloatArray(outLen) { j ->
                     val pos   = j * ratio
-                    val lo    = pos.toInt().coerceIn(0, srcBuf.lastIndex)
-                    val hi    = (lo + 1).coerceIn(0, srcBuf.lastIndex)
+                    val lo    = pos.toInt().coerceIn(0, srcLen - 1)
+                    val hi    = (lo + 1).coerceIn(0, srcLen - 1)
                     val frac  = (pos - lo).toFloat()
-                    val sLo   = srcBuf[lo].toFloat() / 32768f
-                    val sHi   = srcBuf[hi].toFloat() / 32768f
+                    val sLo   = srcArr[lo].toFloat() / 32768f
+                    val sHi   = srcArr[hi].toFloat() / 32768f
                     sLo + frac * (sHi - sLo)
                 }
 

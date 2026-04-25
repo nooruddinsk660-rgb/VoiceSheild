@@ -12,16 +12,7 @@ import java.nio.channels.FileChannel
 import kotlin.math.abs
 import kotlin.math.sqrt
 
-/**
- * FIXES applied:
- *  - Bug #9: outputBuffer size derived from actual output tensor shape via
- *            outT.numElements() instead of hardcoded 2.  Hardcoded value caused
- *            silent garbage reads if the exported model has a different output shape.
- *  - Bug #10: mockScore thresholds recalibrated for the fixed BiomarkerExtractor
- *             (toneratio now in [0,1] with meaningful spread; flux is temporal).
- *  - Bug #11: NnApiDelegate uses Options with CPU fallback enabled for safer init.
- */
-class AASISTClassifier(context: Context) {
+class AASISTClassifier(context: Context, private val rng: kotlin.random.Random = kotlin.random.Random.Default) {
 
     private var interpreter: Interpreter? = null
     var inferenceEngine = "MOCK"
@@ -33,7 +24,6 @@ class AASISTClassifier(context: Context) {
             val options  = Interpreter.Options()
             var delegate = "CPU · 4T"
 
-            // Bug #11 fix: use NnApiDelegate.Options for safe initialisation
             try {
                 val nnOpts = NnApiDelegate.Options().apply {
                     setAllowFp16(true)
@@ -66,8 +56,7 @@ class AASISTClassifier(context: Context) {
         val inScale = inT.quantizationParams().scale.takeIf { it > 0f } ?: 0.00392f
         val inZP    = inT.quantizationParams().zeroPoint
 
-        // ── Instance Normalisation ───────────────────────────────────────
-        // mel is now raw log-mel dB (Bug #2 fix), so z-scoring here is
+        // mel is now raw log-mel dB, so z-scoring here is
         // the SINGLE normalisation pass — correct AASIST pre-processing.
         var sum = 0f; var sqSum = 0f
         for (f in melFeatures) { sum += f; sqSum += f * f }
@@ -82,7 +71,6 @@ class AASISTClassifier(context: Context) {
         }
         inputBuffer.rewind()
 
-        // ── Bug #9 FIX — dynamic output buffer size ───────────────────────
         // Was: ByteBuffer.allocateDirect(2) — hardcoded, breaks if model
         // exports [1,1] sigmoid or any shape other than exactly [1,2].
         val outT       = interp.getOutputTensor(0)
@@ -115,32 +103,20 @@ class AASISTClassifier(context: Context) {
         }
     }
 
-    /**
-     * Bug #10 FIX — recalibrated heuristic thresholds.
-     *
-     * With the fixed BiomarkerExtractor:
-     *   - toneratio is now in [0,1] with ~0.4–0.6 for natural speech, >0.75 for hyper-tonal TTS
-     *   - spectralFlux is temporal (frame-to-frame) with ~0.0 for first window, 0.1–0.35 for speech
-     *   - spectralEntropy, spectralSpread, spectralCentroid are now meaningful
-     *
-     * This fallback is only used when the TFLite model cannot be loaded.
-     */
     private fun mockScore(bio: AudioBiomarkers?): Float {
         if (bio == null) return 0f
 
         // Silence / far-field background gate
-        if (bio.energyDb < -50f) return Math.random().toFloat() * 0.05f
+        if (bio.energyDb < -50f) return rng.nextFloat() * 0.05f
 
         var spoofScore = 0f
 
         // 1. Hyper-tonal spectrum: TTS vocoders often over-synthesise low harmonics
-        //    Fixed range: toneratio > 0.80 = ratio > 3.2× low/high → suspicious
         if (bio.toneratio > 0.80f) {
             spoofScore += (bio.toneratio - 0.80f) * 2.5f
         }
 
         // 2. Unnaturally low temporal spectral flux: TTS is over-smooth frame-to-frame
-        //    Fixed range: flux is temporal dB/bin/normalised; <0.05 = very flat
         if (bio.spectralFlux < 0.05f && bio.spectralFlux >= 0f) {
             spoofScore += (0.05f - bio.spectralFlux) * 4f
         }
@@ -163,7 +139,7 @@ class AASISTClassifier(context: Context) {
         }
 
         // Add tiny stochastic jitter to emulate neural variability
-        spoofScore += (Math.random().toFloat() - 0.5f) * 0.02f
+        spoofScore += (rng.nextFloat() - 0.5f) * 0.02f
 
         return spoofScore.coerceIn(0f, 0.96f)
     }

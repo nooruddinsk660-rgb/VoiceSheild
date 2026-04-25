@@ -32,12 +32,7 @@ class AudioCaptureHelper(private val context: Context) {
 
         val audioProcessor = object : AudioProcessor {
             override fun process(audioEvent: AudioEvent): Boolean {
-                // CRITICAL FIX: TarsosDSP reuses the same floatBuffer object on every
-                // callback. Passing it directly to the pipeline (which processes it
-                // asynchronously on a coroutine) means TarsosDSP overwrites the data
-                // before the pipeline reads it — causing corrupted audio and crashes
-                // approximately 5 seconds into live mode.
-                // Solution: always copy the buffer so each pipeline invocation owns its data.
+                // Copy the buffer to prevent data corruption during asynchronous processing
                 val snapshot = audioEvent.floatBuffer.copyOf()
                 onAudioData(snapshot)
                 return true

@@ -3,105 +3,97 @@ package com.unstop.aivoicedetector
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.exp
+import kotlin.math.max
+import kotlin.math.sqrt
 
 enum class Sensitivity(val threshold: Float) {
-    LOW(0.80f),
-    MEDIUM(0.60f),
-    HIGH(0.45f)
+    LOW(0.80f), MEDIUM(0.60f), HIGH(0.45f)
 }
 
 data class AnomalyEvent(
     val timestampMs:   Long,
     val timeLabel:     String,
     val smoothedScore: Float,
-    val rawScore:      Float
+    val rawScore:      Float,
 )
 
 data class SessionLog(
     val startTime: Long,
-    var endTime:   Long?                      = null,
-    val events:    MutableList<AnomalyEvent>  = mutableListOf(),
-    var maxConfidence:       Float = 0f,
-    var totalWindowsAnalyzed:Int  = 0,
-    var flaggedWindows:      Int  = 0
+    var endTime:   Long?                     = null,
+    val events:    MutableList<AnomalyEvent> = mutableListOf(),
+    var maxConfidence:        Float = 0f,
+    var totalWindowsAnalyzed: Int  = 0,
+    var flaggedWindows:       Int  = 0,
 )
 
-/**
- * Bug #16 FIX — Kalman filter Q/R ratio.
- *
- * Was: processNoise (Q) = 0.01f, measurementNoise (R) = 0.1f → R/Q = 10.
- * This trusted the prior estimate 10× more than new measurements, introducing
- * 5–8 window lag before a sudden score change was reflected.  For real-time
- * deepfake detection where immediate response matters, this is too conservative.
- *
- * Fix: Q = 0.04f, R = 0.12f → R/Q = 3.  Tracks score changes ~3× faster
- * while still smoothing measurement noise adequately.
- */
-class KalmanFilter {
+class AdaptiveKalmanFilter {
     private var estimate         = 0f
     private var errorCovariance  = 1f
+    private val processNoise     = 0.04f     // Q — process noise (rate of change)
 
-    private val processNoise     = 0.04f   // Q — was 0.01f (too slow)
-    private val measurementNoise = 0.12f   // R — was 0.10f
+    // Adaptive measurement noise — updated each step based on innovation
+    private var measurementNoise = 0.12f     // R — starts at conservative value
+    private val R_MIN            = 0.02f     // minimum R (fast response on attack)
+    private val R_MAX            = 0.35f     // maximum R (strong smoothing on silence)
+    private val INNOVATION_SCALE = 2.5f      // how much innovation affects R
 
     fun update(measurement: Float): Float {
-        errorCovariance += processNoise
-        val kalmanGain   = errorCovariance / (errorCovariance + measurementNoise)
-        estimate        += kalmanGain * (measurement - estimate)
-        errorCovariance *= (1f - kalmanGain)
-        return estimate
+        // Innovation = how surprising is this measurement?
+        val innovation    = measurement - estimate
+        val innovationSq  = innovation * innovation
+
+        // IEKF: adapt R — large surprise → lower R (trust measurement)
+        //                  small surprise → higher R (trust prior)
+        measurementNoise = (R_MIN + R_MAX * exp(-innovationSq * INNOVATION_SCALE))
+            .toFloat().coerceIn(R_MIN, R_MAX)
+
+        errorCovariance  += processNoise
+        val kalmanGain    = errorCovariance / (errorCovariance + measurementNoise)
+        estimate         += kalmanGain * innovation
+        errorCovariance  *= (1f - kalmanGain)
+        return estimate.coerceIn(0f, 1f)
     }
 
-    fun reset() {
-        estimate        = 0f
-        errorCovariance = 1f
-    }
+    fun reset() { estimate = 0f; errorCovariance = 1f; measurementNoise = 0.12f }
+    fun currentEstimate() = estimate
 }
 
 class SlidingWindow(private val size: Int = 10) {
     private val buffer = ArrayDeque<Float>()
-
-    fun add(value: Float) {
-        if (buffer.size >= size) buffer.removeFirst()
-        buffer.addLast(value)
+    fun add(v: Float) { if (buffer.size >= size) buffer.removeFirst(); buffer.addLast(v) }
+    fun mean()  = if (buffer.isEmpty()) 0f else buffer.average().toFloat()
+    fun max()   = buffer.maxOrNull() ?: 0f
+    fun stddev(): Float {
+        if (buffer.size < 2) return 0f
+        val m = mean()
+        return sqrt(buffer.map { (it-m)*(it-m) }.average().toFloat())
     }
-
-    fun mean(): Float = if (buffer.isEmpty()) 0f else buffer.average().toFloat()
-    fun max():  Float = buffer.maxOrNull() ?: 0f
-
-    fun vote(threshold: Float): Boolean {
-        val positives = buffer.count { it > threshold }
-        return positives > size / 2
-    }
-
-    fun clear() { buffer.clear() }
+    fun vote(threshold: Float) = buffer.count { it > threshold } > size / 2
+    fun clear() = buffer.clear()
 }
 
 class ConfidenceTracker {
-    private var confidence        = 0f
-    private var lastUpdateTime    = System.currentTimeMillis()
-    private val decayRate         = 0.95f   // per second
+    private var confidence     = 0f
+    private var lastUpdateTime = System.currentTimeMillis()
+    private val decayRate      = 0.95f
 
-    fun update(newScore: Float): Float {
-        val now        = System.currentTimeMillis()
-        val deltaTime  = (now - lastUpdateTime) / 1000f
-        confidence    *= Math.pow(decayRate.toDouble(), deltaTime.toDouble()).toFloat()
-        confidence     = kotlin.math.max(confidence, newScore)
+    fun update(s: Float): Float {
+        val now   = System.currentTimeMillis()
+        val delta = (now - lastUpdateTime) / 1000f
+        confidence    *= Math.pow(decayRate.toDouble(), delta.toDouble()).toFloat()
+        confidence     = max(confidence, s)
         lastUpdateTime = now
         return confidence
     }
-
-    fun reset() {
-        confidence     = 0f
-        lastUpdateTime = System.currentTimeMillis()
-    }
+    fun reset() { confidence = 0f; lastUpdateTime = System.currentTimeMillis() }
 }
 
 class DecisionEngine {
 
     var currentSensitivity = Sensitivity.MEDIUM
 
-    private var kalman            = KalmanFilter()
+    private var kalman            = AdaptiveKalmanFilter()
     private var window            = SlidingWindow(10)
     private var confidenceTracker = ConfidenceTracker()
 
@@ -109,71 +101,55 @@ class DecisionEngine {
         private set
 
     fun startSession() {
-        kalman.reset()
-        window.clear()
-        confidenceTracker.reset()
+        kalman.reset(); window.clear(); confidenceTracker.reset()
         currentSession = SessionLog(startTime = System.currentTimeMillis())
     }
 
-    fun stopSession() {
-        currentSession?.endTime = System.currentTimeMillis()
-    }
+    fun stopSession() { currentSession?.endTime = System.currentTimeMillis() }
 
-    private fun attentionWeightedScore(scores: List<Float>): Float {
-        val weights    = scores.map { kotlin.math.exp(it.toDouble()).toFloat() }
+    private fun attentionWeightedScore(signals: List<Float>): Float {
+        if (signals.isEmpty()) return 0f
+        if (signals.size == 1) return signals[0].coerceIn(0f, 1f)
+        val weights    = signals.map { exp(it.toDouble() * 3.0).toFloat() }  // temperature=3 for sharper peaks
         val sumWeights = weights.sum().coerceAtLeast(1e-6f)
-        return scores.zip(weights).sumOf { (s, w) -> (s * w).toDouble() }
+        return signals.zip(weights).sumOf { (s, w) -> (s * w).toDouble() }
             .toFloat() / sumWeights
     }
 
-    /**
-     * Bug #17 FIX — dynamic threshold adaptive component.
-     *
-     * Was: `max(base, maxConfidence * 0.75f)`.
-     * Problem: if maxConfidence hits 0.90, threshold rises to 0.675.
-     * If score later drops to 0.65 (a real re-emergence to 0.68), the system
-     * fails to re-flag because 0.68 < 0.675.
-     *
-     * Fix: cap the adaptive boost at base × 1.15 (only 15% above base sensitivity).
-     * This still reduces false positives from noise spikes while allowing
-     * genuine re-emergent threats to be flagged at near-base-threshold.
-     */
-    fun processBatch(scores: List<Float>): Float {
-        val attentionScore = attentionWeightedScore(scores)
-        val clamped        = attentionScore.coerceIn(0f, 1f)
+    fun processBatch(signals: List<Float>): Float {
+        val attentionScore  = attentionWeightedScore(signals)
+        val clamped         = attentionScore.coerceIn(0f, 1f)
+        val kalmanScore     = kalman.update(clamped)
 
-        val kalmanScore = kalman.update(clamped)
         window.add(kalmanScore)
+        val meanScore  = window.mean()
+        val maxScore   = window.max()
+        val stdScore   = window.stddev()
 
-        val meanScore = window.mean()
-        val maxScore  = window.max()
-        val finalScore = 0.6f * meanScore + 0.4f * maxScore
+        // Blend mean + max, attenuated by std dev (noisy = less confident)
+        val finalScore = (0.6f * meanScore + 0.4f * maxScore) * (1f - stdScore * 0.3f)
 
-        val decayedConfidence = confidenceTracker.update(finalScore)
+        val decayedConf = confidenceTracker.update(finalScore)
 
-        val session = currentSession ?: return decayedConfidence
+        val session = currentSession ?: return decayedConf
         session.totalWindowsAnalyzed++
-        if (decayedConfidence > session.maxConfidence) session.maxConfidence = decayedConfidence
+        if (decayedConf > session.maxConfidence) session.maxConfidence = decayedConf
 
         val baseThreshold = currentSensitivity.threshold
-
-        // Bug #17 fix: cap adaptive lift at 15% above base threshold
+        // Adaptive lift capped at 15% above base
         val adaptiveLift  = (session.maxConfidence * 0.75f).coerceAtMost(baseThreshold * 1.15f)
-        val threshold     = kotlin.math.max(baseThreshold, adaptiveLift)
+        val threshold     = max(baseThreshold, adaptiveLift)
 
-        if (window.vote(threshold) && decayedConfidence > threshold) {
+        if (window.vote(threshold) && decayedConf > threshold) {
             session.flaggedWindows++
             val now   = System.currentTimeMillis()
             val label = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(now))
-
-            // Deduplicate: suppress events closer than 500 ms apart
             if (session.events.isEmpty() || now - session.events.last().timestampMs > 500L) {
-                session.events.add(
-                    AnomalyEvent(now, label, decayedConfidence, attentionScore)
-                )
+                session.events.add(AnomalyEvent(now, label, decayedConf, attentionScore))
             }
         }
-
-        return decayedConfidence
+        return decayedConf
     }
+
+    fun currentKalmanEstimate() = kalman.currentEstimate()
 }

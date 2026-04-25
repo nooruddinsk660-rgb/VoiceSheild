@@ -3,131 +3,104 @@ package com.unstop.aivoicedetector
 import kotlin.math.*
 
 data class AudioBiomarkers(
-    val spectralCentroid: Float,   // Hz — weighted mean freq; TTS compresses this
-    val spectralSpread:   Float,   // Hz — variance around centroid; synthetic = narrower
-    val spectralFlux:     Float,   // 0-1 — TRUE frame-to-frame energy delta; TTS = unnaturally smooth
-    val toneratio:        Float,   // 0-1 — low-freq dominance (0=flat, 1=very tonal)
-    val energyDb:         Float,   // dBFS — overall loudness
-    val zeroCrossRate:    Float,   // Hz — zero-crossing rate from raw PCM
-    val f0Estimate:       Float,   // Hz — rough pitch via autocorrelation
-    val spectralEntropy:  Float,   // 0-1 — disorder in spectrum; synthetic = low entropy
+    val spectralCentroid: Float,  // Hz
+    val spectralSpread:   Float,  // Hz
+    val spectralFlux:     Float,  // 0-1 temporal delta
+    val toneratio:        Float,  // 0-1 low-freq dominance
+    val energyDb:         Float,  // dBFS
+    val zeroCrossRate:    Float,  // Hz
+    val f0Estimate:       Float,  // Hz autocorrelation
+    val spectralEntropy:  Float,  // 0-1 disorder
+    // NEW features
+    val spectralFlatness: Float,  // 0-1 Wiener entropy — codec artefact indicator
+    val jitter:           Float,  // F0 cycle-to-cycle variation — TTS has near-zero jitter
+    val shimmer:          Float,  // amplitude cycle-to-cycle variation — TTS is too smooth
+    val harmonicRatio:    Float,  // HNR: harmonic-to-noise — low = codec noise floor
+    val codecScore:       Float,  // 0-1 composite codec fingerprint score
 )
 
-/**
- * FIXES applied:
- *  - Bug #5: spectralFlux now computes TRUE temporal flux (frame-to-frame difference)
- *            by storing the previous mel frame.  Was erroneously computing bin-to-bin
- *            variation within a single frame.
- *  - Bug #6: zeroCrossRate extra /2f removed — was reporting half the true ZCR.
- *  - Bug #7: toneratio now normalised by /4f so values spread across [0,1] instead
- *            of always collapsing to 1.0 due to low/high energy ratio always > 1.
- *  - Object → Class: state (prevMelFrame) needed for temporal flux.
- *            Call reset() at the start of every new session.
- *  - Biomarker correctness improved now that FeatureExtractor returns raw log-mel dB
- *    (Bug #2 fix), so the +80f shift correctly converts dB values to a positive scale.
- */
 class BiomarkerExtractor {
 
-    private val SR     = 16000f
-    private val N_MELS = 80
+    private val SR      = 16000f
+    private val N_MELS  = 80
+    private val TARGET_RMS = 0.08f    // normalise all windows to this RMS before extraction
 
-    // State for temporal spectral flux — Bug #5 fix
     private var prevMelFrame: FloatArray? = null
+    private var smoothedFlux  = 0f        // RASTA-like EMA on flux
+    private val FLUX_ALPHA    = 0.72f     // smoothing factor (higher = more inertia)
 
-    /** Call at every session boundary to clear stale previous-frame state. */
-    fun reset() {
-        prevMelFrame = null
-    }
+    fun reset() { prevMelFrame = null; smoothedFlux = 0f }
 
-    // ── Public entry point ───────────────────────────────────────────────
+    fun extract(rawPcm: FloatArray, melBands: FloatArray,
+                spectralFlatness: Float = 0f): AudioBiomarkers {
 
-    fun extract(rawPcm: FloatArray, melBands: FloatArray): AudioBiomarkers {
-        val centroid = spectralCentroid(melBands)
-        val spread   = spectralSpread(melBands, centroid)
-        val flux     = spectralFlux(melBands)           // uses & updates prevMelFrame
-        val tonal    = toneratio(melBands)
-        val energy   = energyDb(rawPcm)
-        val zcr      = zeroCrossRate(rawPcm)
-        val f0       = f0Estimate(rawPcm)
-        val entropy  = spectralEntropy(melBands)
+        // Energy-normalise raw PCM before feature extraction
+        val normPcm = energyNormalise(rawPcm)
 
-        // Save current frame for next call's flux computation
+        val centroid  = spectralCentroid(melBands)
+        val spread    = spectralSpread(melBands, centroid)
+        val rawFlux   = spectralFlux(melBands)
+        val tonal     = toneratio(melBands)
+        val energy    = energyDb(normPcm)   // dBFS of normalised signal
+        val zcr       = zeroCrossRate(normPcm)
+        val f0        = f0Estimate(normPcm)
+        val entropy   = spectralEntropy(melBands)
+
+        // RASTA-like smoothing on flux — removes single-frame noise spikes
+        smoothedFlux = if (prevMelFrame == null) rawFlux
+                       else FLUX_ALPHA * smoothedFlux + (1f - FLUX_ALPHA) * rawFlux
+
+        val jit   = computeJitter(normPcm, f0)
+        val shim  = computeShimmer(normPcm, f0)
+        val hnr   = computeHNR(melBands)
+        val codec = computeCodecScore(spectralFlatness, melBands, hnr)
+
         prevMelFrame = melBands.copyOf()
 
-        return AudioBiomarkers(centroid, spread, flux, tonal, energy, zcr, f0, entropy)
+        return AudioBiomarkers(centroid, spread, smoothedFlux, tonal, energy, zcr,
+            f0, entropy, spectralFlatness, jit, shim, hnr, codec)
     }
 
-    // ── Feature implementations ──────────────────────────────────────────
+    private fun energyNormalise(pcm: FloatArray): FloatArray {
+        if (pcm.isEmpty()) return pcm
+        val rms = sqrt(pcm.map { it * it }.average()).toFloat()
+        if (rms < 1e-9f) return pcm
+        val gain = (TARGET_RMS / rms).coerceAtMost(20f)   // cap gain at 26dB
+        return FloatArray(pcm.size) { i -> pcm[i] * gain }
+    }
 
-    /**
-     * Weighted mean frequency across mel bands.
-     * Each bin's energy is the linear amplitude derived from log-mel dB (+80f shift
-     * moves the floor from ≈–80 dB to ≈0, giving a non-negative linear-ish scale).
-     */
     private fun spectralCentroid(mel: FloatArray): Float {
-        if (mel.isEmpty()) return 0f
-        var weightedSum = 0f
-        var totalEnergy = 0f
+        var wSum = 0f; var tSum = 0f
         mel.forEachIndexed { i, v ->
-            val e  = max(0f, v + 80f)
-            val hz = melBinToHz(i, mel.size)
-            weightedSum += hz * e
-            totalEnergy += e
+            val e = max(0f, v + 80f)
+            wSum += melBinToHz(i, mel.size) * e; tSum += e
         }
-        return if (totalEnergy < 1e-9f) 0f else weightedSum / totalEnergy
+        return if (tSum < 1e-9f) 0f else wSum / tSum
     }
 
     private fun spectralSpread(mel: FloatArray, centroid: Float): Float {
-        if (mel.isEmpty()) return 0f
-        var weightedVar = 0f
-        var totalEnergy = 0f
+        var wVar = 0f; var tSum = 0f
         mel.forEachIndexed { i, v ->
-            val e  = max(0f, v + 80f)
-            val hz = melBinToHz(i, mel.size)
-            weightedVar += (hz - centroid).pow(2) * e
-            totalEnergy += e
+            val e = max(0f, v + 80f); val hz = melBinToHz(i, mel.size)
+            wVar += (hz - centroid).pow(2) * e; tSum += e
         }
-        return if (totalEnergy < 1e-9f) 0f else sqrt(weightedVar / totalEnergy)
+        return if (tSum < 1e-9f) 0f else sqrt(wVar / tSum)
     }
 
-    /**
-     * Bug #5 FIX — TRUE temporal spectral flux.
-     *
-     * Was: `abs(mel[i] - mel[i-1])` across bins in a SINGLE frame
-     *   → measured bin-to-bin roughness, not temporal change.
-     *
-     * Now: Euclidean distance between the current averaged mel frame and the
-     *      previous one, normalised to [0, 1].  Returns 0 on the very first window
-     *      (no previous frame yet).  TTS/vocoders have unnaturally low flux (<0.05);
-     *      natural speech is typically 0.10–0.35.
-     */
     private fun spectralFlux(mel: FloatArray): Float {
         val prev = prevMelFrame ?: return 0f
-        if (mel.size != prev.size) return 0f
+        if (mel.size != prev.size) return smoothedFlux
         var diff = 0f
         for (i in mel.indices) diff += abs(mel[i] - prev[i])
-        // Normalise: each dB difference can be ~1–20 dB; 80-bin array
         return (diff / mel.size / 20f).coerceIn(0f, 1f)
     }
 
-    /**
-     * Bug #7 FIX — toneratio normalised to [0,1].
-     *
-     * Was: low/high ratio coerceIn(0,1).  Since low-frequency energy almost always
-     *   exceeds high-frequency in speech (ratio typically 1.5–3.0), the value was
-     *   ALWAYS clamped to 1.0 — completely uninformative.
-     *
-     * Fix: divide by 4f so the normal speech range (1.5–2.5) maps to ~0.38–0.62,
-     *   and hyper-tonal TTS (ratio >3) maps to >0.75.
-     *   0 = spectrally flat (unusual); 1 = extreme low-freq dominance.
-     */
     private fun toneratio(mel: FloatArray): Float {
         if (mel.size < 20) return 0f
         val low  = mel.slice(0 until 20).map { max(0f, it + 80f) }.average().toFloat()
         val high = mel.slice(20 until mel.size).map { max(0f, it + 80f) }
-                     .average().toFloat().coerceAtLeast(1e-9f)
-        val ratio = low / high
-        return (ratio / 4f).coerceIn(0f, 1f)
+            .average().toFloat().coerceAtLeast(1e-9f)
+        return (low / high / 4f).coerceIn(0f, 1f)
     }
 
     private fun energyDb(pcm: FloatArray): Float {
@@ -136,75 +109,110 @@ class BiomarkerExtractor {
         return if (rms < 1e-9f) -96f else (20f * log10(rms)).coerceIn(-96f, 0f)
     }
 
-    /**
-     * Bug #6 FIX — removed erroneous `/ 2f`.
-     *
-     * Correct formula: ZCR (Hz) = crossings × SR / numSamples
-     * Was: crossings / numSamples × SR / 2  → exactly half the true value.
-     */
     private fun zeroCrossRate(pcm: FloatArray): Float {
         if (pcm.size < 2) return 0f
-        var crossings = 0
-        for (i in 1 until pcm.size) {
-            if ((pcm[i] >= 0f) != (pcm[i - 1] >= 0f)) crossings++
-        }
-        // ZCR in Hz = zero-crossings per second
-        return (crossings.toFloat() * SR / pcm.size).coerceIn(0f, SR / 2f)
+        var c = 0
+        for (i in 1 until pcm.size) if ((pcm[i] >= 0f) != (pcm[i-1] >= 0f)) c++
+        return (c.toFloat() * SR / pcm.size).coerceIn(0f, SR / 2f)
     }
 
-    /**
-     * Autocorrelation-based F0 estimate (80–400 Hz).
-     * Returns 0 if signal is unvoiced or energy is too low.
-     */
     fun f0Estimate(pcm: FloatArray): Float {
-        val windowSize = minOf(2048, pcm.size)
-        if (windowSize < 128) return 0f
-        val window = pcm.take(windowSize).toFloatArray()
-
-        // Apply Hann window to reduce edge effects
-        val hannedWindow = FloatArray(windowSize) { i ->
-            window[i] * (0.5f - 0.5f * cos(2.0 * PI * i / (windowSize - 1)).toFloat())
+        val ws = minOf(2048, pcm.size)
+        if (ws < 128) return 0f
+        val w = FloatArray(ws) { i -> pcm[i] * (0.5f - 0.5f * cos(2.0 * PI * i / (ws-1)).toFloat()) }
+        val minLag = (SR / 400f).toInt(); val maxLag = (SR / 80f).toInt()
+        var totalE = 0f; for (s in w) totalE += s * s
+        if (totalE < 1e-6f) return 0f
+        var best = minLag; var bestC = Float.MIN_VALUE
+        for (lag in minLag..minOf(maxLag, ws/2)) {
+            var c = 0f; for (i in 0 until ws - lag) c += w[i] * w[i + lag]
+            if (c > bestC) { bestC = c; best = lag }
         }
-
-        val minLag = (SR / 400f).toInt()   // lag for 400 Hz
-        val maxLag = (SR / 80f).toInt()    // lag for 80 Hz
-
-        // Compute total energy for normalisation
-        var totalEnergy = 0f
-        for (s in hannedWindow) totalEnergy += s * s
-        if (totalEnergy < 1e-6f) return 0f   // unvoiced / silence
-
-        var bestLag  = minLag
-        var bestCorr = Float.MIN_VALUE
-        for (lag in minLag..minOf(maxLag, windowSize / 2)) {
-            var corr = 0f
-            for (i in 0 until windowSize - lag) corr += hannedWindow[i] * hannedWindow[i + lag]
-            if (corr > bestCorr) { bestCorr = corr; bestLag = lag }
-        }
-
-        // Normalised correlation must be reasonably strong
-        return if (bestCorr / totalEnergy < 0.1f) 0f
-               else (SR / bestLag).coerceIn(80f, 400f)
+        return if (bestC / totalE < 0.1f) 0f else (SR / best).coerceIn(80f, 400f)
     }
 
-    /**
-     * Spectral entropy — measures uniformity of energy distribution.
-     * TTS/vocoders concentrate energy in narrow bands → low entropy.
-     * Natural speech is spectrally diverse → higher entropy.
-     */
     private fun spectralEntropy(mel: FloatArray): Float {
-        if (mel.isEmpty()) return 1f
         val energies = mel.map { max(0f, it + 80f) }
-        val total    = energies.sum().coerceAtLeast(1e-9f)
-        val probs    = energies.map { it / total }
-        val entropy  = -probs.sumOf { p ->
-            if (p < 1e-12) 0.0 else p * log2(p.toDouble())
-        }
-        val maxEntropy = log2(mel.size.toDouble())
-        return (entropy / maxEntropy).toFloat().coerceIn(0f, 1f)
+        val total = energies.sum().coerceAtLeast(1e-9f)
+        val probs = energies.map { it / total }
+        val entropy = -probs.sumOf { p -> if (p < 1e-12) 0.0 else p * log2(p.toDouble()) }
+        return (entropy / log2(mel.size.toDouble())).toFloat().coerceIn(0f, 1f)
     }
 
-    // ── Utilities ────────────────────────────────────────────────────────
+    // Natural speech: 0.5–2%. TTS synthesises perfectly periodic pitch → near 0.
+    private fun computeJitter(pcm: FloatArray, f0: Float): Float {
+        if (f0 < 80f || pcm.size < 256) return 0f
+        val periodSamples = (SR / f0).toInt().coerceAtLeast(1)
+        val cycles = mutableListOf<Int>()
+        var pos = periodSamples
+        while (pos + periodSamples < pcm.size) {
+            // Find zero-crossing near expected period boundary
+            var zc = pos
+            for (k in -5..5) {
+                val idx = pos + k
+                if (idx > 0 && idx < pcm.size - 1 &&
+                    pcm[idx - 1] < 0f && pcm[idx] >= 0f) { zc = idx; break }
+            }
+            cycles.add(zc); pos += periodSamples
+        }
+        if (cycles.size < 3) return 0f
+        val periods = (1 until cycles.size).map { (cycles[it] - cycles[it-1]).toFloat() }
+        val meanP = periods.average().toFloat()
+        val jitter = periods.map { abs(it - meanP) }.average().toFloat() / meanP
+        return jitter.coerceIn(0f, 0.20f)   // cap at 20%
+    }
+
+    // Natural speech: 1–5%. TTS is amplitude-smooth → near 0.
+    private fun computeShimmer(pcm: FloatArray, f0: Float): Float {
+        if (f0 < 80f || pcm.size < 256) return 0f
+        val periodSamples = (SR / f0).toInt().coerceAtLeast(1)
+        val amps = mutableListOf<Float>()
+        var pos = 0
+        while (pos + periodSamples < pcm.size) {
+            var peak = 0f
+            for (k in 0 until periodSamples) peak = maxOf(peak, abs(pcm[pos + k]))
+            amps.add(peak); pos += periodSamples
+        }
+        if (amps.size < 3) return 0f
+        val diffs = (1 until amps.size).map { abs(amps[it] - amps[it-1]) }
+        val meanA = amps.average().toFloat().coerceAtLeast(1e-9f)
+        return (diffs.average().toFloat() / meanA).coerceIn(0f, 0.30f)
+    }
+
+    // Codec compression introduces a noise floor in upper bands → lowers HNR.
+    private fun computeHNR(mel: FloatArray): Float {
+        if (mel.size < 40) return 1f
+        // Approximate: energy in voiced bands (bins 5-25, ~200-1200Hz)
+        // vs energy in upper noise-prone bands (bins 60-79, >6kHz)
+        val voiced = mel.slice(5..25).map { max(0f, it + 80f) }.average().toFloat()
+        val noise  = mel.slice(60..minOf(79, mel.lastIndex))
+            .map { max(0f, it + 80f) }.average().toFloat().coerceAtLeast(1e-9f)
+        return (voiced / noise / 8f).coerceIn(0f, 1f)
+    }
+
+    // Detects OPUS/AAC/MP3-compressed TTS being replayed over microphone.
+    // Three signals: (1) high spectral flatness, (2) cutoff above 7kHz,
+    // (3) low HNR (codec noise floor).
+    private fun computeCodecScore(flatness: Float, mel: FloatArray, hnr: Float): Float {
+        var score = 0f
+
+        // Signal 1: Wiener entropy > 0.55 suggests codec-flattened spectrum
+        if (flatness > 0.55f) score += (flatness - 0.55f) / 0.45f * 0.35f
+
+        // Signal 2: Band-limited cutoff — codec at <32kbps cuts above 7kHz
+        // Mel bin 76+ ≈ >7kHz; very low energy there suggests codec cutoff
+        if (mel.size > 76) {
+            val highE = mel.slice(76..mel.lastIndex).map { max(0f, it + 80f) }.average().toFloat()
+            val midE  = mel.slice(30..59).map { max(0f, it + 80f) }.average().toFloat().coerceAtLeast(1e-9f)
+            val ratio = highE / midE
+            if (ratio < 0.08f) score += (0.08f - ratio) / 0.08f * 0.35f
+        }
+
+        // Signal 3: Low HNR → codec noise floor introduced
+        if (hnr < 0.35f) score += (0.35f - hnr) / 0.35f * 0.30f
+
+        return score.coerceIn(0f, 1f)
+    }
 
     private fun melBinToHz(bin: Int, nBins: Int): Float {
         val melMax  = 2595f * log10(1f + 8000f / 700f)
